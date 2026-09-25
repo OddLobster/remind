@@ -13,7 +13,6 @@ import re
 import shlex
 import subprocess
 import sys
-import textwrap
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -441,6 +440,51 @@ docker build -t myapp .  # build image from ./Dockerfile
 docker compose up -d  # start compose stack (down to stop)
 docker system prune  # remove stopped containers, unused data
 """,
+    "docker compose": r"""
+docker compose up -d  # start in background
+docker compose up -d --build  # rebuild images and restart
+docker compose ps  # status of services
+docker compose logs -f  # follow logs of all services
+docker compose exec web sh  # shell inside service 'web'
+docker compose down  # stop and remove containers
+docker compose down -v  # ... and delete volumes (data!)
+""",
+    "git remote": r"""
+git remote -v  # list remotes with URLs
+git remote add upstream https://github.com/user/repo.git  # add a remote
+git remote set-url {remote} git@github.com:user/repo.git  # change URL (e.g. https -> ssh)
+git remote show {remote}  # details: branches, tracking
+git remote rename {remote} new-name  # rename a remote
+git remote remove <name>  # remove a remote
+git fetch {remote}  # download without merging
+""",
+    "git stash": r"""
+git stash  # park uncommitted changes
+git stash -u  # ... including untracked files
+git stash push -m 'wip: message'  # with a description
+git stash list  # all stashes
+git stash show -p stash@{0}  # what's inside a stash
+git stash pop  # re-apply the latest and remove it
+git stash apply stash@{1}  # re-apply a specific one, keep it
+git stash drop <stash@{n}>  # delete a stash
+""",
+    "git branch": r"""
+git branch -a  # all branches, incl. remote
+git branch -vv  # with upstream and last commit
+git switch -c new-branch  # create and switch
+git branch -m new-name  # rename the current branch
+git branch --merged  # branches already merged into this one
+git branch -d <branch>  # delete a merged branch (-D to force)
+git push {remote} --delete <branch>  # delete a remote branch
+""",
+    "git log": r"""
+git log --oneline --graph --all -20  # compact graph of all branches
+git log -p -- {file}  # changes to one file
+git log --since='2 weeks ago'  # recent commits
+git log -S 'text'  # commits that added/removed some text
+git log {remote}/{branch}..HEAD  # commits not pushed yet
+git shortlog -sn  # number of commits per author
+""",
     "jq": r"""
 jq . {json}  # pretty print
 jq 'keys' {json}  # top-level keys
@@ -543,6 +587,11 @@ def git_branch():
     return branch if branch and branch != "HEAD" else "main"
 
 
+def git_remote():
+    remotes = sh("git", "remote").split()
+    return "origin" if "origin" in remotes else nth(remotes, 0, "origin")
+
+
 def docker_first(what, fmt, default):
     names = [n for n in sh("docker", what, "--format", fmt).split() if "<none>" not in n]
     return nth(names, 0, default)
@@ -568,6 +617,7 @@ CONTEXT = {
     "iface": iface,
     "host": ssh_host,
     "branch": git_branch,
+    "remote": git_remote,
     "container": lambda: docker_first("ps", "{{.Names}}", "mycontainer"),
     "image": lambda: docker_first("images", "{{.Repository}}:{{.Tag}}", "ubuntu"),
 }
@@ -668,19 +718,29 @@ def add(command):
 def main():
     TEMPLATES.update({cmd: "\n".join(lines) for cmd, lines in load_user_templates().items()})
     args = sys.argv[1:]
-    if len(args) == 2 and args[0] == "--add":
-        return add(args[1])
+    if len(args) > 1 and args[0] == "--add":
+        return add(" ".join(args[1:]))
     if not args or args[0].startswith("-"):
-        print("usage: remind <command>\n       remind --add <command>   (generate with an LLM)\n\nknown commands:")
-        print(textwrap.fill("  ".join(sorted(TEMPLATES)), initial_indent="  ", subsequent_indent="  "))
+        print("usage: remind <command> [subcommand]\n       remind --add <command> [subcommand]   (generate with an LLM)\n\nknown commands:")
+        line = " "
+        for name in sorted(TEMPLATES):
+            if len(line) + len(name) > 76:
+                print(line)
+                line = " "
+            line += " " + (f"[{name}]" if " " in name else name)
+        print(line)
         return 0
 
-    command = ALIASES.get(args[0], args[0])
+    name = " ".join(args)
+    command = ALIASES.get(name, name)
     if command not in TEMPLATES:
-        print(f"no reminder for '{args[0]}' yet, add one with: remind --add {args[0]}", file=sys.stderr)
+        print(f"no reminder for '{name}' yet, add one with: remind --add {name}", file=sys.stderr)
         return 1
 
     show(command)
+    subcommands = [n.split(" ", 1)[1] for n in sorted(TEMPLATES) if n.startswith(command + " ")]
+    if subcommands:
+        print(f"\n  more: remind {command} {'|'.join(subcommands)}")
     return 0
 
 
