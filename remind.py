@@ -20,7 +20,7 @@ from functools import cache
 from pathlib import Path
 
 MODEL = os.environ.get("REMIND_MODEL", "deepseek/deepseek-v4.1-flash")
-USER_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "remind" / "templates.json"
+USER_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "remind" / "reminders.txt"
 
 # Each line: "command  # comment". {name} is filled from CONTEXT below.
 TEMPLATES = {
@@ -625,8 +625,8 @@ CONTEXT = {
 PLACEHOLDER = re.compile(r"\{(\w+)\}")
 
 
-def examples(command):
-    lines = [line.partition(" # ") for line in TEMPLATES[command].strip().splitlines()]
+def examples(template):
+    lines = [line.partition(" # ") for line in template.strip().splitlines()]
     needed = {m for cmd, _, _ in lines for m in PLACEHOLDER.findall(cmd) if m in CONTEXT}
     values = {name: shlex.quote(CONTEXT[name]()) for name in needed}
 
@@ -636,27 +636,45 @@ def examples(command):
     return [(fill(cmd), note.strip()) for cmd, _, note in lines]
 
 
-def show(command):
-    rows = examples(command)
+def show(template):
+    rows = examples(template)
     width = min(max(len(cmd) for cmd, _ in rows), 55)
     dim, reset = ("\033[2m", "\033[0m") if sys.stdout.isatty() else ("", "")
     for cmd, note in rows:
-        print(f"  {cmd.ljust(width)}  {dim}# {note}{reset}")
+        print(f"  {cmd.ljust(width)}  {dim}# {note}{reset}" if note else f"  {cmd}")
 
 
-def load_user_templates():
-    """Your own reminders (added with --add), stored as {"cmd": ["line", ...]}."""
+def read_user():
+    """Your own reminders: a [name] line, then "command  # comment" lines."""
+    user, name = {}, None
     try:
-        return json.loads(USER_FILE.read_text())
+        text = USER_FILE.read_text()
     except FileNotFoundError:
-        return {}
+        return user
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            name = line[1:-1]
+            user.setdefault(name, [])
+        elif line and not line.startswith("#") and name:
+            user[name].append(line)
+    return user
 
 
-def ask_llm(command):
-    """Ask the model on OpenRouter for template lines for a command."""
+def save_user(name, lines):
+    user = read_user()
+    user.setdefault(name, []).extend(lines)
+    USER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    USER_FILE.write_text("\n\n".join(f"[{n}]\n" + "\n".join(ls) for n, ls in user.items()) + "\n")
+
+
+def ask_llm(task):
+    """Ask the model on OpenRouter for template lines. Returns [] (and says why) on failure."""
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        print("set OPENROUTER_API_KEY first", file=sys.stderr)
+        return []
     placeholders = ", ".join("{" + name + "}" for name in CONTEXT)
-    prompt = f"""Write 4-6 short, practical examples for the Linux command `{command}`.
-Focus on the most common uses and the syntax people usually forget.
+    prompt = f"""{task}
 
 Output ONLY lines in this exact format, nothing else, no markdown:
 command  # short comment
@@ -664,7 +682,7 @@ command  # short comment
 You may use these placeholders, they get replaced with real values from the user's machine:
 {placeholders}
 (file/file2 = files in current dir, dir = subdirectory, script = .sh/.py file, ext = common file
-extension, proc/pid = a running process, host = ssh host, cwd = current directory)
+extension, proc/pid = a running process, host = ssh alias (only for ssh/scp/rsync), cwd = current directory)
 Destructive examples (deleting, killing, overwriting) must NOT use placeholders;
 use <angle-bracket> names like <file> instead.
 
@@ -676,52 +694,88 @@ Example for `tar`:
         data=json.dumps({"model": MODEL, "messages": [{"role": "user", "content": prompt}]}).encode(),
         headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        text = json.load(response)["choices"][0]["message"]["content"]
+    print(f"asking {MODEL} ...", file=sys.stderr)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            text = json.load(response)["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        print(f"OpenRouter error {e.code}: {e.read().decode()}", file=sys.stderr)
+        return []
+    except (urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError) as e:
+        print(f"request failed: {e}", file=sys.stderr)
+        return []
     lines = [line.strip().strip("`") for line in text.splitlines()]
-    return [line for line in lines if " # " in line and not line.startswith("#")]
+    lines = [line for line in lines if " # " in line and not line.startswith("#")]
+    if not lines:
+        print("the model returned no usable answer, try again", file=sys.stderr)
+    return lines
 
 
 def add(command):
     if command in TEMPLATES:
         print(f"'{command}' already has a reminder", file=sys.stderr)
         return 1
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        print("set OPENROUTER_API_KEY first", file=sys.stderr)
-        return 1
-
-    print(f"asking {MODEL} ...", file=sys.stderr)
-    try:
-        lines = ask_llm(command)
-    except urllib.error.HTTPError as e:
-        print(f"OpenRouter error {e.code}: {e.read().decode()}", file=sys.stderr)
-        return 1
-    except (urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError) as e:
-        print(f"request failed: {e}", file=sys.stderr)
-        return 1
+    lines = ask_llm(f"Write 4-6 short, practical examples for the Linux command `{command}`.\n"
+                    "Focus on the most common uses and the syntax people usually forget.")
     if not lines:
-        print("the model returned no usable examples, try again", file=sys.stderr)
         return 1
-
-    TEMPLATES[command] = "\n".join(lines)
-    show(command)
+    show("\n".join(lines))
     if input("\nsave? [Y/n] ").strip().lower() not in ("", "y", "yes"):
         return 0
-    user = load_user_templates()
-    user[command] = lines
-    USER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    USER_FILE.write_text(json.dumps(user, indent=2) + "\n")
+    save_user(command, lines)
     print(f"saved to {USER_FILE}")
     return 0
 
 
+def ask(question):
+    """Answer a free-form question with commands, e.g. remind "find big files"."""
+    lines = ask_llm(f"Answer this question with 1-5 Linux shell commands, the most direct answer first:\n{question}")
+    if not lines:
+        return 1
+    show("\n".join(lines))
+    return 0
+
+
+def keep(line):
+    """Save a command you just ran (passed in by the `keep` shell function)."""
+    line = line.strip()
+    if not line:
+        print("nothing to keep. Add this to your ~/.bashrc and run `keep` after a command:\n"
+              '  keep() { remind --keep "$(fc -ln -1)"; }', file=sys.stderr)
+        return 1
+    words = line.split()
+    if words[0] == "sudo" and len(words) > 1:
+        words = words[1:]
+    two = ALIASES.get(" ".join(words[:2]), " ".join(words[:2]))
+    name = two if two in TEMPLATES else ALIASES.get(words[0], words[0])
+
+    print(f"  {line}")
+    comment = input("comment: ").strip()
+    if not comment:
+        print("no comment, nothing saved", file=sys.stderr)
+        return 1
+    save_user(name, [f"{line}  # {comment}"])
+    print(f"added to [{name}]")
+    return 0
+
+
 def main():
-    TEMPLATES.update({cmd: "\n".join(lines) for cmd, lines in load_user_templates().items()})
+    # your own lines go below the built-in ones, marked with a star
+    for name, lines in read_user().items():
+        mine = "\n".join(line.replace(" # ", " # \u2605 ", 1) for line in lines)
+        TEMPLATES[name] = (TEMPLATES.get(name, "").strip() + "\n" + mine).strip()
+
     args = sys.argv[1:]
     if len(args) > 1 and args[0] == "--add":
         return add(" ".join(args[1:]))
+    if args and args[0] == "--keep":
+        return keep(" ".join(args[1:]))
     if not args or args[0].startswith("-"):
-        print("usage: remind <command> [subcommand]\n       remind --add <command> [subcommand]   (generate with an LLM)\n\nknown commands:")
+        print("usage: remind <command> [subcommand]\n"
+              "       remind --add <command> [subcommand]   generate with an LLM\n"
+              "       remind --keep '<command line>'        save a command you ran\n"
+              '       remind "<question>"                   ask, e.g. remind "find big files"\n\n'
+              "known commands:")
         line = " "
         for name in sorted(TEMPLATES):
             if len(line) + len(name) > 76:
@@ -733,11 +787,13 @@ def main():
 
     name = " ".join(args)
     command = ALIASES.get(name, name)
+    if command not in TEMPLATES and len(args) == 1 and " " in name:
+        return ask(name)
     if command not in TEMPLATES:
         print(f"no reminder for '{name}' yet, add one with: remind --add {name}", file=sys.stderr)
         return 1
 
-    show(command)
+    show(TEMPLATES[command])
     subcommands = [n.split(" ", 1)[1] for n in sorted(TEMPLATES) if n.startswith(command + " ")]
     if subcommands:
         print(f"\n  more: remind {command} {'|'.join(subcommands)}")
