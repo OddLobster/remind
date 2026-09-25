@@ -1,0 +1,15 @@
+[project]
+name = "remind"
+version = "0.1.0"
+description = "Short, runnable examples for Linux commands, filled with values from where you are"
+requires-python = ">=3.9"
+
+[project.scripts]
+remind = "remind:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["remind"]
